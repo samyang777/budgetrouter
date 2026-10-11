@@ -143,6 +143,84 @@ gate with real models, check the price table in
 `budgetrouter.DEFAULT_PRICES`: the shipped vendor entries are illustrative
 defaults, so verify them against the vendor's current pricing page.
 
+### Verifying against a real API
+
+Both adapters are covered by integration tests against a local stub
+server that speaks the real API shapes (see `tests/test_adapters.py`).
+To verify against a real endpoint, use
+[`examples/live_smoke_test.py`](examples/live_smoke_test.py): point it
+at any OpenAI-compatible endpoint with a real key (it defaults to
+GitHub Models' free tier) and it exercises the adapter plus a
+router + budget round-trip. The Anthropic adapter has *not* yet been
+verified against Anthropic's live API (there is no free tier for the
+native API); it follows the documented request/response format and the
+stub tests.
+
+## Async
+
+Agent code is async by default, so budgetrouter ships a full async API:
+`AsyncRouter`, `AsyncFakeProvider`, and async twins of both real
+adapters (`AsyncOpenAICompatibleProvider`, `AsyncAnthropicProvider`).
+`AsyncRouter.complete` mirrors the sync router's semantics exactly —
+same routing rules, same fallback chain, same budget behavior
+(`BudgetExceeded` still propagates immediately and is never treated as
+a provider failure). One deliberate addition: when a budget gate is
+attached, each attempt's check → call → record cycle runs under a lock,
+so concurrent calls can never race past the cap and recorded spend is a
+hard ceiling. Without a budget, calls run fully concurrently.
+
+```python
+import asyncio
+
+from budgetrouter import (
+    AsyncFakeProvider,
+    AsyncRouter,
+    BudgetGate,
+    Route,
+    RouteRule,
+)
+
+async def main() -> None:
+    providers = {
+        "fake": AsyncFakeProvider(
+            {"fake-small": "4", "fake-large": "4 (with a full proof sketch)"},
+        ),
+    }
+    router = AsyncRouter(
+        providers=providers,
+        rules=[RouteRule(provider="fake", model="fake-large", tag="hard")],
+        default=Route(provider="fake", model="fake-small"),
+        fallbacks=[Route(provider="fake", model="fake-small")],
+        budget=BudgetGate(budget_usd=1.00, per_request_cap_usd=0.05),
+    )
+    easy = await router.complete([{"role": "user", "content": "What is 2 + 2?"}])
+    hard = await router.complete(
+        [{"role": "user", "content": "What is 2 + 2? Show your work."}],
+        tag="hard",
+    )
+    print(easy.text, "|", hard.text)
+
+asyncio.run(main())
+```
+
+Two honesty notes. First, the async adapters are async at the event-loop
+level, not at the socket level: the package has zero dependencies, so
+there is no async HTTP client — the blocking `urllib` call runs via
+`asyncio.to_thread`. Concurrent calls genuinely overlap and the loop
+never blocks, at the cost of one worker thread per in-flight request.
+Second, the sync `Router` also has an `acomplete` method with the same
+semantics, which runs a provider's native `acomplete` when it defines
+one and bridges a sync-only provider through a worker thread — existing
+providers keep working in async apps unchanged.
+
+[`examples/langgraph_integration.py`](examples/langgraph_integration.py)
+puts `AsyncRouter` inside a LangGraph `StateGraph` — a classify node on
+the cheap model, an answer node on the strong one, one budget gate per
+run — and runs key-free against `AsyncFakeProvider` (langgraph itself is
+an example-only dependency; budgetrouter does not depend on it).
+[`examples/langgraph_example.py`](examples/langgraph_example.py) shows
+the same idea using `Router.acomplete` in a single node.
+
 ## Demo: an agent workload
 
 [`examples/agent_workload_demo.py`](examples/agent_workload_demo.py) runs
@@ -163,12 +241,41 @@ per-model breakdown:
   gpt-4o-mini  6 calls, 840 tokens, $0.000234
 ```
 
+## How this differs from LiteLLM / hosted gateways
+
+- **In-process library, not a proxy or a mega-SDK.** Hosted gateways
+  (Portkey, LiteLLM Proxy, OpenRouter-style services) put a network hop
+  and a running service between your code and the model. LiteLLM the SDK
+  is in-process, but its center of gravity is breadth: 100+ provider
+  adapters behind one interface. budgetrouter is a few hundred lines you
+  import; the routing, fallback, and budget logic runs in your process,
+  under your tests, with no extra service to deploy or keep up.
+- **Budget enforcement is a first-class API, not a dashboard setting.**
+  The gate is consulted before every call and updated after it, in code:
+  per-run and per-request caps raise `BudgetExceeded` in the call path,
+  so an agent loop stops instead of overspending. In gateway products,
+  budgets typically live in admin configuration and alerting, outside
+  the program's control flow.
+- **Two API shapes, deliberately.** The bundled adapters cover the
+  OpenAI chat-completions shape (which many providers and local servers
+  speak) and Anthropic's messages shape. Anything else can implement
+  the small `Provider` / `AsyncProvider` protocol directly — the router
+  does not care how a provider talks.
+- **Zero dependencies.** Standard library only, including the async
+  adapters (see the Async section for exactly what that means).
+- **What it does not do:** it is not an agent framework, not a hosted
+  control plane (no dashboards, key management, or observability
+  pipeline), and not a billing system. If you need those, use a gateway
+  product — possibly with budgetrouter inside the agent process as well.
+
 ## Features
 
 - Ordered routing rules by tag and estimated input size, with a default route
 - Fallback chain across providers/models on provider errors
 - Budget gate with per-run and per-request caps and an editable price table
 - Bundled OpenAI-compatible and Anthropic adapters (stdlib only, env-var keys)
+- Full async API (`AsyncRouter`, `AsyncFakeProvider`, async adapters) with
+  a lock-guarded budget gate, so concurrent calls cannot overshoot the cap
 - Provider protocol + `FakeProvider` for tests, demos, and CI
 - Minimal eval runner (`exact` / `includes` scoring, JSONL datasets)
 - Zero runtime dependencies (standard library only), typed, Python ≥ 3.10
@@ -189,7 +296,7 @@ per-model breakdown:
 
 ## Roadmap
 
-- Async provider support (`acomplete`) and streaming completions
+- Streaming completions
 - Precise tokenizers for pre-call estimates (per-provider, opt-in)
 - Cost reporting helpers (per-tag / per-model spend breakdowns)
 - Weighted and latency-aware routing strategies
