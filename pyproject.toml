@@ -5,12 +5,40 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "budgetrouter"
 version = "0.1.0"
-description = "Lightweight multi-model routing for LLM/agent apps: routing rules, fallback chains, and budget gates, plus a tiny eval runner."
+description = "Lightweight multi-model routing for LLM and agent applications: pick the right model for each request, fall back when a provider fails, and stop the run when the budget runs out."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Sen Yang" }]
 requires-python = ">=3.10"
 dependencies = []
+keywords = [
+    "llm",
+    "agents",
+    "routing",
+    "cost",
+    "budget",
+    "openai",
+    "anthropic",
+    "ai-agents",
+    "langgraph",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/samyang777/budgetrouter"
+Repository = "https://github.com/samyang777/budgetrouter"
+Issues = "https://github.com/samyang777/budgetrouter/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
