@@ -5,9 +5,19 @@ Costs are estimated from a simple editable price table of USD per 1K tokens
 (with estimated token counts) and updated *after* it (with actual usage), so
 a runaway agent loop hits a clear :class:`BudgetExceeded` error instead of a
 surprise bill.
+
+Admission is estimate-based, by necessity: a call's true cost exists only
+after the call returns. A call admitted under a cap can therefore push
+recorded spend past that cap by its estimation error — but recording is
+always truthful, and once recorded spend reaches a cap, every further call
+is refused before it is made.
 """
 
 from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from .provider import Usage
 
@@ -53,6 +63,12 @@ class BudgetGate:
     ``budget_usd`` caps the whole run; ``per_request_cap_usd`` (optional)
     caps any single call, which catches accidental calls to a very expensive
     model even when the run budget is still healthy.
+
+    Both caps gate *admission* on the estimated cost (see :meth:`check`);
+    :meth:`record` then books the *actual* cost. A single call whose actual
+    usage exceeds its estimate can therefore carry recorded spend past a
+    cap by that estimation error. What the caps guarantee is that no
+    further call is admitted once recorded spend has reached them.
     """
 
     def __init__(
@@ -68,6 +84,24 @@ class BudgetGate:
         self.per_request_cap_usd = per_request_cap_usd
         self.prices = prices if prices is not None else DEFAULT_PRICES
         self._spent = 0.0
+        self._async_lock: asyncio.Lock | None = None
+
+    @asynccontextmanager
+    async def hold(self) -> AsyncIterator[None]:
+        """Serialize check → call → record across everyone sharing this gate.
+
+        Async routers wrap each budgeted attempt in this hold so that two
+        concurrent calls cannot both pass the pre-call check against the
+        same remaining budget. The lock lives on the gate — not on any
+        router — so the protection also covers several router instances
+        sharing one gate. It is created lazily, inside whichever event
+        loop first uses it. Sync callers don't need it: their check →
+        call → record cycle never awaits in between.
+        """
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        async with self._async_lock:
+            yield
 
     @property
     def spent(self) -> float:
