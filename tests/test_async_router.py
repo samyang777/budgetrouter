@@ -3,7 +3,8 @@
 Mirrors the sync router/adapter tests for the class-based async API:
 routing and fallback with AsyncFakeProvider, the urllib-backed async
 adapters against a local stub server, budget enforcement under
-concurrency (a hard cap that racing calls cannot overshoot), and a
+concurrency (admission serialized through the gate, so racing calls
+cannot all pass the same pre-call check), and a
 concurrency proof that slow calls overlap instead of serializing.
 
 No pytest-asyncio: coroutines are driven with ``asyncio.run`` so the
@@ -351,7 +352,47 @@ def test_budget_cap_holds_under_concurrent_race():
     assert len(successes) == 3
     assert len(failures) == 7
     assert all(isinstance(f, BudgetExceeded) for f in failures)
-    # The invariant that matters: recorded spend never exceeds the cap.
+    # The invariant that matters here: with estimates equal to actuals,
+    # recorded spend never exceeds the cap.
     assert gate.spent == pytest.approx(per_call * 3)
     assert gate.spent <= cap
+    assert len(provider.calls) == 3  # blocked calls never reached the provider
+
+
+def test_shared_gate_serializes_across_router_instances():
+    # Two AsyncRouters sharing one gate: the lock lives on the gate, so
+    # the race protection is not per-router. Same numbers as the race
+    # test above — the cap fits exactly 3 of the 10 concurrent calls —
+    # and the provider's delay means unsynchronized checks would all
+    # pass before any spend is recorded.
+    per_call = estimate_cost("fake-small", 12, 8)
+    cap = per_call * 3.5
+    gate = BudgetGate(budget_usd=cap)
+    provider = AsyncFakeProvider(
+        "answer", input_tokens=12, output_tokens=8, delay=0.05
+    )
+    routers = [
+        AsyncRouter(
+            providers={"fake": provider},
+            default=Route(provider="fake", model="fake-small"),
+            budget=gate,
+            expected_output_tokens=8,
+        )
+        for _ in range(2)
+    ]
+    messages = [{"role": "user", "content": "x" * 48}]
+
+    async def race():
+        return await asyncio.gather(
+            *(r.complete(messages) for r in routers for _ in range(5)),
+            return_exceptions=True,
+        )
+
+    results = run(race())
+    successes = [r for r in results if isinstance(r, Completion)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 3
+    assert len(failures) == 7
+    assert all(isinstance(f, BudgetExceeded) for f in failures)
+    assert gate.spent == pytest.approx(per_call * 3)
     assert len(provider.calls) == 3  # blocked calls never reached the provider
