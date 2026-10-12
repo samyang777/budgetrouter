@@ -45,6 +45,28 @@ def test_record_accumulates_spend_and_remaining():
     assert gate.remaining == pytest.approx(0.007)
 
 
+def test_usage_rejects_negative_token_counts():
+    # A negative count would subtract from recorded spend if it got through.
+    with pytest.raises(ValueError, match="negative"):
+        Usage(input_tokens=-1, output_tokens=0)
+    with pytest.raises(ValueError, match="negative"):
+        Usage(input_tokens=0, output_tokens=-5)
+
+
+def test_admitted_call_overshoot_is_recorded_then_blocks():
+    # Admission is estimate-based: this call's estimate fits the budget,
+    # its actual usage does not. The actual cost is recorded truthfully —
+    # recorded spend passes the cap by the estimation error — and every
+    # later call is refused before it is made.
+    gate = BudgetGate(budget_usd=0.001, prices=PRICES)
+    gate.check("fake-small", est_input_tokens=100, est_output_tokens=50)
+    cost = gate.record("fake-small", Usage(input_tokens=1000, output_tokens=1000))
+    assert cost == pytest.approx(0.003)
+    assert gate.spent > gate.budget_usd
+    with pytest.raises(BudgetExceeded):
+        gate.check("fake-small", est_input_tokens=1, est_output_tokens=1)
+
+
 def test_router_spend_accumulates_across_calls_until_cap():
     provider = FakeProvider("ok", input_tokens=1000, output_tokens=1000)
     # Each recorded call costs 1000/1000*0.001 + 1000/1000*0.002 = $0.003.
