@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from budgetrouter import (
+    AsyncFakeProvider,
     BudgetExceeded,
     BudgetGate,
     Completion,
@@ -177,3 +178,38 @@ def test_router_acomplete_with_real_adapter_and_budget(stub_url):
     out = run(router.acomplete(MESSAGES))
     assert out.text == "stub async answer"
     assert gate.spent > 0  # usage from the async call was recorded
+
+
+def test_acomplete_budget_race_is_serialized_by_the_gate():
+    # Estimates equal actuals (48 chars -> 12 input tokens, 8 expected
+    # output tokens); the cap fits exactly 3 of 10 concurrent calls. The
+    # provider sleeps, so without the gate's hold every call would pass
+    # the pre-call check before any of them records its spend.
+    prices = {"fake-small": (0.001, 0.002)}
+    per_call = 12 / 1000 * 0.001 + 8 / 1000 * 0.002
+    gate = BudgetGate(budget_usd=per_call * 3.5, prices=prices)
+    provider = AsyncFakeProvider(
+        "answer", input_tokens=12, output_tokens=8, delay=0.05
+    )
+    router = Router(
+        providers={"fake": provider},
+        default=Route(provider="fake", model="fake-small"),
+        budget=gate,
+        expected_output_tokens=8,
+    )
+    messages = [{"role": "user", "content": "x" * 48}]
+
+    async def race():
+        return await asyncio.gather(
+            *(router.acomplete(messages) for _ in range(10)),
+            return_exceptions=True,
+        )
+
+    results = run(race())
+    successes = [r for r in results if isinstance(r, Completion)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 3
+    assert len(failures) == 7
+    assert all(isinstance(f, BudgetExceeded) for f in failures)
+    assert gate.spent == pytest.approx(per_call * 3)
+    assert len(provider.calls) == 3  # blocked calls never reached the provider
