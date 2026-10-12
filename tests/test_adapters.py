@@ -122,6 +122,17 @@ def test_openai_adapter_parses_response(stub):
     assert request["body"]["model"] == "stub-small"
 
 
+def test_adapter_sends_explicit_user_agent(stub):
+    # urllib's default Python-urllib agent is rejected by some gateways
+    # (Cloudflare error 1010); the adapters must identify themselves.
+    base_url, server = stub
+    provider = OpenAICompatibleProvider(base_url, "stub-small", api_key="test-key")
+    provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    user_agent = server.requests[-1]["headers"].get("user-agent", "")
+    assert user_agent.startswith("budgetrouter/")
+    assert "urllib" not in user_agent
+
+
 def test_anthropic_adapter_parses_response_and_splits_system(stub):
     base_url, server = stub
     provider = AnthropicProvider("stub-large", api_key="test-key", base_url=base_url)
