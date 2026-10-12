@@ -123,24 +123,35 @@ class Router:
         ``acomplete`` when it defines one; a sync-only provider's
         ``complete`` is run in a worker thread, so existing providers keep
         working unchanged in async applications such as LangGraph.
+
+        When a budget is attached, each attempt's check → call → record
+        cycle runs under the gate's lock (:meth:`BudgetGate.hold`), so
+        concurrent ``acomplete`` calls sharing one gate cannot race the
+        pre-call check — the same protection :class:`AsyncRouter` gives.
         """
         est_input = estimate_tokens(messages)
         primary = self.pick_route(tag, est_input)
         attempts = [primary] + [f for f in self.fallbacks if f != primary]
         errors: list[str] = []
         for route in attempts:
-            if self.budget is not None:
-                self.budget.check(route.model, est_input, self.expected_output_tokens)
             provider = self.providers[route.provider]
             try:
-                completion = await self._call_provider_async(
-                    provider, messages, route.model
-                )
+                if self.budget is not None:
+                    async with self.budget.hold():
+                        self.budget.check(
+                            route.model, est_input, self.expected_output_tokens
+                        )
+                        completion = await self._call_provider_async(
+                            provider, messages, route.model
+                        )
+                        self.budget.record(route.model, completion.usage)
+                else:
+                    completion = await self._call_provider_async(
+                        provider, messages, route.model
+                    )
             except ProviderError as exc:
                 errors.append(f"{route.provider}/{route.model}: {exc}")
                 continue
-            if self.budget is not None:
-                self.budget.record(route.model, completion.usage)
             return completion
         raise ProviderError(
             "all routes failed: " + ("; ".join(errors) if errors else "no routes configured")
@@ -169,12 +180,20 @@ class AsyncRouter:
 
     The one deliberate difference is concurrency control. When a
     :class:`BudgetGate` is attached, each attempt's check → call →
-    record cycle runs under an :class:`asyncio.Lock`. Without that, two
-    concurrent calls could both pass the pre-call check against the same
-    remaining budget and overshoot the cap; with it, recorded spend can
-    never exceed the cap. The trade-off is honesty-worthy: calls through
-    one ``AsyncRouter`` serialize *while a budget is attached*. With no
-    budget, nothing is locked and calls run fully concurrently.
+    record cycle runs under the gate's own lock (see
+    :meth:`BudgetGate.hold`). Without that, two concurrent calls could
+    both pass the pre-call check against the same remaining budget and
+    overshoot the cap. Because the lock lives on the gate, the protection
+    also covers calls made through *other* routers sharing the same
+    gate. The trade-off is honesty-worthy: budgeted calls through a
+    shared gate serialize. With no budget, nothing is locked and calls
+    run fully concurrently.
+
+    The lock serializes admission; it does not make recorded spend a
+    hard ceiling. The gate admits calls by *estimated* cost and records
+    *actual* cost, so one call whose true usage exceeds its estimate can
+    carry recorded spend past the cap by that estimation error. Once
+    recorded spend reaches the cap, every subsequent call is refused.
     """
 
     def __init__(
@@ -193,7 +212,6 @@ class AsyncRouter:
         self.fallbacks = fallbacks or []
         self.budget = budget
         self.expected_output_tokens = expected_output_tokens
-        self._budget_lock = asyncio.Lock()
         referenced = (
             [r.provider for r in self.rules]
             + [default.provider]
@@ -220,7 +238,7 @@ class AsyncRouter:
             provider = self.providers[route.provider]
             try:
                 if self.budget is not None:
-                    async with self._budget_lock:
+                    async with self.budget.hold():
                         self.budget.check(
                             route.model, est_input, self.expected_output_tokens
                         )
