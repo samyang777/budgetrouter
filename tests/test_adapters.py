@@ -37,6 +37,23 @@ ANTHROPIC_BODY = {
     "usage": {"input_tokens": 80, "output_tokens": 40},
 }
 
+OPENAI_NO_USAGE_BODY = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "stub openai answer"}}
+    ]
+}
+
+ANTHROPIC_NO_USAGE_BODY = {
+    "content": [{"type": "text", "text": "stub anthropic answer"}]
+}
+
+OPENAI_NEGATIVE_USAGE_BODY = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "stub openai answer"}}
+    ],
+    "usage": {"prompt_tokens": -100, "completion_tokens": 50},
+}
+
 
 class StubHandler(BaseHTTPRequestHandler):
     """Records requests on the server; paths under /fail return HTTP 500."""
@@ -54,11 +71,22 @@ class StubHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/fail"):
             payload = b'{"error": "stub failure"}'
             self.send_response(500)
+        elif self.path.startswith("/badutf8"):
+            payload = b"\xff\xfe\x00 not valid utf-8"
+            self.send_response(200)
         elif self.path.endswith("/chat/completions"):
-            payload = json.dumps(OPENAI_BODY).encode()
+            if self.path.startswith("/nousage"):
+                payload = json.dumps(OPENAI_NO_USAGE_BODY).encode()
+            elif self.path.startswith("/negusage"):
+                payload = json.dumps(OPENAI_NEGATIVE_USAGE_BODY).encode()
+            else:
+                payload = json.dumps(OPENAI_BODY).encode()
             self.send_response(200)
         elif self.path.endswith("/v1/messages"):
-            payload = json.dumps(ANTHROPIC_BODY).encode()
+            if self.path.startswith("/nousage"):
+                payload = json.dumps(ANTHROPIC_NO_USAGE_BODY).encode()
+            else:
+                payload = json.dumps(ANTHROPIC_BODY).encode()
             self.send_response(200)
         else:
             payload = b'{"error": "unknown path"}'
@@ -182,3 +210,82 @@ def test_budget_exceeded_with_real_adapters(stub):
     with pytest.raises(BudgetExceeded):
         router.complete([{"role": "user", "content": "hello"}])
     assert gate.spent == 0.0  # blocked before any call was made
+
+
+def test_invalid_utf8_body_raises_provider_error(stub):
+    base_url, _ = stub
+    provider = OpenAICompatibleProvider(
+        f"{base_url}/badutf8", "stub-small", api_key="test-key"
+    )
+    with pytest.raises(ProviderError, match="undecodable"):
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+
+
+def test_router_falls_back_on_undecodable_body(stub):
+    base_url, _ = stub
+    providers = {
+        "primary": OpenAICompatibleProvider(
+            f"{base_url}/badutf8", "stub-small", api_key="k", name="primary"
+        ),
+        "backup": OpenAICompatibleProvider(
+            base_url, "stub-small", api_key="k", name="backup"
+        ),
+    }
+    router = Router(
+        providers=providers,
+        default=Route(provider="primary", model="stub-small"),
+        fallbacks=[Route(provider="backup", model="stub-small")],
+    )
+    out = router.complete([{"role": "user", "content": "hello"}])
+    assert out.text == "stub openai answer"
+    assert out.provider == "backup"  # undecodable body counts as a failure
+
+
+def test_openai_missing_usage_is_estimated_not_free(stub):
+    base_url, _ = stub
+    provider = OpenAICompatibleProvider(
+        f"{base_url}/nousage", "stub-small", api_key="test-key"
+    )
+    out = provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    # "hi" -> ceil(2/4) = 1 input token; the 18-char answer -> ceil(18/4) = 5.
+    assert out.usage.input_tokens == 1
+    assert out.usage.output_tokens == 5
+    assert out.usage.total_tokens > 0
+
+
+def test_anthropic_missing_usage_is_estimated_not_free(stub):
+    base_url, _ = stub
+    provider = AnthropicProvider(
+        "stub-large", api_key="test-key", base_url=f"{base_url}/nousage"
+    )
+    out = provider.complete([{"role": "user", "content": "hi"}], "stub-large")
+    assert out.usage.input_tokens == 1
+    # "stub anthropic answer" is 21 chars -> ceil(21/4) = 6.
+    assert out.usage.output_tokens == 6
+    assert out.usage.total_tokens > 0
+
+
+def test_missing_usage_still_records_spend(stub):
+    base_url, _ = stub
+    providers = {
+        "real": OpenAICompatibleProvider(
+            f"{base_url}/nousage", "stub-small", api_key="k"
+        ),
+    }
+    gate = BudgetGate(budget_usd=1.00, prices=PRICES)
+    router = Router(
+        providers=providers,
+        default=Route(provider="real", model="stub-small"),
+        budget=gate,
+    )
+    router.complete([{"role": "user", "content": "hello"}])
+    assert gate.spent > 0  # a usage-less response is never a free call
+
+
+def test_negative_usage_raises_provider_error(stub):
+    base_url, _ = stub
+    provider = OpenAICompatibleProvider(
+        f"{base_url}/negusage", "stub-small", api_key="test-key"
+    )
+    with pytest.raises(ProviderError, match="negative"):
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
