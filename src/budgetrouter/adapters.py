@@ -25,6 +25,14 @@ from .provider import Completion, Message, ProviderError, Usage
 ANTHROPIC_VERSION = "2023-06-01"
 """Value sent in the ``anthropic-version`` header."""
 
+USER_AGENT = "budgetrouter/0.1.0"
+"""Value sent in the ``User-Agent`` header of every adapter request.
+
+urllib's default ``Python-urllib/x.y`` agent is rejected outright by
+some API gateways (Cloudflare-fronted endpoints answer HTTP 403, error
+1010), so the adapters identify themselves explicitly instead.
+"""
+
 
 def _resolve_api_key(
     api_key: str | None, api_key_env: str, provider_name: str
@@ -56,7 +64,11 @@ def _post_json(
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", **headers},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            **headers,
+        },
         method="POST",
     )
     try:
