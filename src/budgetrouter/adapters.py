@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -60,7 +61,7 @@ def _post_json(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
+            raw_bytes = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:200]
         raise ProviderError(
@@ -73,6 +74,12 @@ def _post_json(
     except TimeoutError as exc:
         raise ProviderError(f"{provider_name}: request to {url} timed out") from exc
     try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProviderError(
+            f"{provider_name}: undecodable response from {url}: {exc}"
+        ) from exc
+    try:
         decoded = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProviderError(
@@ -81,6 +88,61 @@ def _post_json(
     if not isinstance(decoded, dict):
         raise ProviderError(f"{provider_name}: unexpected response shape from {url}")
     return decoded
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate for a text: ~4 characters per token."""
+    return math.ceil(len(text) / 4) if text else 0
+
+
+def _parse_usage(
+    usage_data: object,
+    *,
+    input_key: str,
+    output_key: str,
+    input_fallback: int,
+    output_fallback: int,
+    provider_name: str,
+) -> Usage:
+    """Build a :class:`Usage` from a provider's usage block.
+
+    A provider that omits usage — or just one of its fields — must not
+    make the call free: the missing counts are estimated from the
+    request and response text (the ``input_fallback`` / ``output_fallback``
+    arguments), using the heuristic above. Values that are present but
+    negative or non-numeric are malformed and raise :class:`ProviderError`;
+    a negative count would otherwise *reduce* recorded spend in the
+    budget gate.
+    """
+    if usage_data is None:
+        return Usage(input_tokens=input_fallback, output_tokens=output_fallback)
+    if not isinstance(usage_data, dict):
+        raise ProviderError(
+            f"{provider_name}: malformed usage block: {usage_data!r}"
+        )
+    parsed: dict[str, int] = {}
+    for key, fallback in (
+        (input_key, input_fallback),
+        (output_key, output_fallback),
+    ):
+        raw_value = usage_data.get(key)
+        if raw_value is None:
+            parsed[key] = fallback
+            continue
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ProviderError(
+                f"{provider_name}: malformed usage value {key}={raw_value!r}"
+            ) from exc
+        if value < 0:
+            raise ProviderError(
+                f"{provider_name}: negative usage value {key}={value}"
+            )
+        parsed[key] = value
+    return Usage(
+        input_tokens=parsed[input_key], output_tokens=parsed[output_key]
+    )
 
 
 class OpenAICompatibleProvider:
@@ -119,15 +181,20 @@ class OpenAICompatibleProvider:
         )
         try:
             text = data["choices"][0]["message"]["content"] or ""
-            usage_data = data.get("usage") or {}
-            usage = Usage(
-                input_tokens=int(usage_data.get("prompt_tokens", 0)),
-                output_tokens=int(usage_data.get("completion_tokens", 0)),
-            )
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+        except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(
                 f"{self.name}: malformed chat-completions response: {exc}"
             ) from exc
+        usage = _parse_usage(
+            data.get("usage"),
+            input_key="prompt_tokens",
+            output_key="completion_tokens",
+            input_fallback=_estimate_tokens(
+                "".join(m.get("content", "") for m in messages)
+            ),
+            output_fallback=_estimate_tokens(text),
+            provider_name=self.name,
+        )
         return Completion(
             text=text, model=use_model, provider=self.name, usage=usage
         )
@@ -198,15 +265,20 @@ class AnthropicProvider:
                 for block in data["content"]
                 if block.get("type") == "text"
             )
-            usage_data = data.get("usage") or {}
-            usage = Usage(
-                input_tokens=int(usage_data.get("input_tokens", 0)),
-                output_tokens=int(usage_data.get("output_tokens", 0)),
-            )
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, AttributeError) as exc:
             raise ProviderError(
                 f"{self.name}: malformed messages response: {exc}"
             ) from exc
+        usage = _parse_usage(
+            data.get("usage"),
+            input_key="input_tokens",
+            output_key="output_tokens",
+            input_fallback=_estimate_tokens(
+                "".join(m.get("content", "") for m in messages)
+            ),
+            output_fallback=_estimate_tokens(text),
+            provider_name=self.name,
+        )
         return Completion(
             text=text, model=use_model, provider=self.name, usage=usage
         )
