@@ -25,6 +25,15 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
 
+    def __post_init__(self) -> None:
+        # A negative count is never legitimate usage; left through, it
+        # would *reduce* recorded spend in the budget gate.
+        if self.input_tokens < 0 or self.output_tokens < 0:
+            raise ValueError(
+                "token counts cannot be negative: "
+                f"input={self.input_tokens}, output={self.output_tokens}"
+            )
+
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
