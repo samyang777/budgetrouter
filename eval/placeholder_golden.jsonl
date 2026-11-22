@@ -1,0 +1,5 @@
+{"input": "What is the capital of France?", "target": "Paris", "tag": "easy"}
+{"input": "What is 2 + 2?", "target": "4", "tag": "easy"}
+{"input": "What color is the sky on a clear day?", "target": "blue", "tag": "easy"}
+{"input": "Prove briefly why the sum of two even integers is even.", "target": "2", "tag": "hard"}
+{"input": "Summarize why a budget cap should not trigger fallback spending.", "target": "budget", "tag": "hard"}

@@ -58,28 +58,53 @@ and runs as-is after `pip install -e .`.
   adapters cover the OpenAI and Anthropic API shapes (see below);
   `FakeProvider` is the in-memory implementation for tests and demos, with
   canned responses, fixed token counts, and simulated failures.
-- **Router** — holds providers, an ordered list of `RouteRule`s, a default
-  route, and a fallback chain. Rules match on a caller-supplied tag (e.g.
-  `"hard"`, `"summarize"`) and/or estimated input size, so cheap requests go
-  to cheap models and hard or long ones go to stronger models. If the chosen
-  provider raises `ProviderError`, the next fallback is tried.
-- **BudgetGate** — tracks cumulative spend using an editable per-model price
-  table (USD per 1K tokens). It checks an estimate before each call and
-  records actual usage after. Exceeding the per-run budget — or the optional
-  per-request cap — raises `BudgetExceeded`, which the router deliberately
-  does *not* treat as a provider failure: being out of budget is terminal,
-  not a reason to spend elsewhere.
-- **Eval runner** — a tiny JSONL harness (`{"input", "target"}` per line)
-  with exact-match and substring scoring so routing changes can be
-  smoke-checked for quality next to their cost:
+- **Router & FallbackPolicy** — holds providers, an ordered list of
+  `RouteRule`s, a default route, a fallback chain, and a configurable
+  `FallbackPolicy`. Rules match on a caller-supplied tag (e.g. `"hard"`,
+  `"summarize"`) and/or estimated input size. Provider failures are
+  classified on `ProviderError.kind` (`timeout`, `rate_limit`, `server_error`,
+  `auth`, `invalid_request`, `transport`, `bad_response`, `unknown`) with
+  optional `status_code`. By default, `auth` failures abort immediately
+  (no pointless fallback on a bad key) while other failures move down the
+  fallback chain; retries (`retry_then_fallback`) and cross-provider auth
+  failover are opt-in policy settings. Every attempt is recorded as an
+  `AttemptRecord` on `Completion.attempts` (or `ProviderError.attempts` /
+  `BudgetExceeded.attempts` on failure) — concurrency-safe and visible,
+  never silent.
+- **BudgetGate & BudgetManager** — `BudgetGate` tracks cumulative spend for
+  one run using an editable per-model price table (USD per 1K tokens), with
+  optional per-request caps and a one-shot warning threshold (default `0.8`,
+  via `on_warning(bucket, spent, budget)` + `gate.warned`). `BudgetManager`
+  adds independent per-bucket caps (keyed by an explicit `bucket="..."`
+  argument on `complete()` / `acomplete()`, separate from `tag`), so
+  exhausting one tenant or task never blocks another. Exceeding any cap
+  raises `BudgetExceeded`, which the router deliberately does *not* treat as
+  a provider failure: being out of budget is terminal, not a reason to spend
+  elsewhere.
+- **UsageLedger** — every router owns (or accepts) an in-memory `UsageLedger`
+  that records all attempts (successes, provider errors, budget rejections,
+  and downgrades). Call `router.usage_summary()` (default grouped by
+  `("bucket", "model")`, or `"model"` / `"bucket"`) for structured metrics
+  or `.format_table()` for a one-screen summary table.
+- **Eval runner & regression gate** — a JSONL harness (`{"input", "target"}`
+  per line) with `exact` / `includes` scoring, error-rate tracking,
+  `run_router_eval()` (putting quality, route, cost, and downgrade status on
+  the same `CaseResult` record), and `check_gate(report, min_pass_rate=0.90,
+  max_error_rate=0.05)`:
 
   ```console
-  $ python -m budgetrouter.eval --demo
+  $ python -m budgetrouter.eval --demo --gate
   [PASS] input='What is the capital of France?' target='Paris' output='Paris'
   [PASS] input='What is 2 + 2?' target='4' output='4'
   [PASS] input='What color is the sky on a clear day?' target='blue' output='The sky is blue.'
   3/3 passed (100%)
+  [GATE PASS] pass_rate=100% (min 90%), error_rate=0% (max 5%)
   ```
+
+  To gate against your own router or callable with a real dataset, pass
+  `--data <path.jsonl> --target my_module:answer_fn --gate`. A clearly
+  labelled placeholder dataset lives at
+  [`eval/placeholder_golden.jsonl`](eval/placeholder_golden.jsonl).
 
 ## Real providers
 
@@ -241,6 +266,12 @@ per-model breakdown:
   gpt-4o-mini  6 calls, 840 tokens, $0.000234
 ```
 
+[`examples/full_workflow_demo.py`](examples/full_workflow_demo.py) exercises
+failure-aware fallback (`FallbackPolicy`), bucketed budgets (`BudgetManager`
+with warning callbacks), usage attribution (`router.usage_summary().format_table()`),
+and the eval regression gate (`run_router_eval` + `check_gate`) end to end
+with `FakeProvider` — no API keys or network required.
+
 ## How this differs from LiteLLM / hosted gateways
 
 - **In-process library, not a proxy or a mega-SDK.** Hosted gateways
@@ -271,13 +302,18 @@ per-model breakdown:
 ## Features
 
 - Ordered routing rules by tag and estimated input size, with a default route
-- Fallback chain across providers/models on provider errors
-- Budget gate with per-run and per-request caps and an editable price table
+- Failure-classified fallback (`ProviderError.kind` + `FallbackPolicy`) and
+  per-attempt logs on `Completion.attempts` / raised exceptions
+- Single-run (`BudgetGate`) and per-bucket (`BudgetManager`) spend caps with
+  per-request caps, one-shot warning hooks, and an editable price table
+- In-memory usage attribution (`UsageLedger`) with grouped summaries and
+  ASCII table rendering
 - Bundled OpenAI-compatible and Anthropic adapters (stdlib only, env-var keys)
 - Full async API (`AsyncRouter`, `AsyncFakeProvider`, async adapters) with
-  a lock-guarded budget gate, so concurrent calls cannot overshoot the cap
+  lock-guarded budget gates per bucket
 - Provider protocol + `FakeProvider` for tests, demos, and CI
-- Minimal eval runner (`exact` / `includes` scoring, JSONL datasets)
+- Eval runner & regression gate (`check_gate`, `run_router_eval`, CLI `--gate`
+  and `--target`) with cost and quality on the same record
 - Zero runtime dependencies (standard library only), typed, Python ≥ 3.10
 
 ## Non-goals
@@ -298,7 +334,6 @@ per-model breakdown:
 
 - Streaming completions
 - Precise tokenizers for pre-call estimates (per-provider, opt-in)
-- Cost reporting helpers (per-tag / per-model spend breakdowns)
 - Weighted and latency-aware routing strategies
 
 ## Development

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "budgetrouter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight multi-model routing for LLM and agent applications: pick the right model for each request, fall back when a provider fails, and stop the run when the budget runs out."
 readme = "README.md"
 license = "MIT"

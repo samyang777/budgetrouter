@@ -27,6 +27,7 @@ from budgetrouter import (
     BudgetExceeded,
     BudgetGate,
     Completion,
+    FallbackPolicy,
     ProviderError,
     Route,
     RouteRule,
@@ -396,3 +397,62 @@ def test_shared_gate_serializes_across_router_instances():
     assert all(isinstance(f, BudgetExceeded) for f in failures)
     assert gate.spent == pytest.approx(per_call * 3)
     assert len(provider.calls) == 3  # blocked calls never reached the provider
+
+
+# ---------------------------------------------------------------------------
+# AsyncRouter failure classification, FallbackPolicy, and attempt isolation
+# ---------------------------------------------------------------------------
+
+
+def test_async_router_auth_aborts_without_fallback():
+    bad = AsyncFakeProvider(name="bad", fail_times=1, fail_kind="auth", fail_status_code=401)
+    backup = AsyncFakeProvider("backup", name="backup")
+    router = AsyncRouter(
+        providers={"bad": bad, "backup": backup},
+        default=Route(provider="bad", model="fake-large"),
+        fallbacks=[Route(provider="backup", model="fake-small")],
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        run(router.complete(MESSAGES))
+    assert exc_info.value.kind == "auth"
+    assert exc_info.value.status_code == 401
+    assert backup.calls == []
+    assert [a.outcome for a in exc_info.value.attempts] == ["auth"]
+
+
+def test_async_router_retry_then_fallback_and_attempt_log():
+    flaky = AsyncFakeProvider("recovered", name="primary", fail_times=1, fail_kind="timeout")
+    backup = AsyncFakeProvider("backup", name="backup")
+    router = AsyncRouter(
+        providers={"primary": flaky, "backup": backup},
+        default=Route(provider="primary", model="fake-large"),
+        fallbacks=[Route(provider="backup", model="fake-small")],
+        fallback_policy=FallbackPolicy(actions={"timeout": "retry_then_fallback"}, max_retries=1),
+    )
+    out = run(router.complete(MESSAGES))
+    assert out.text == "recovered"
+    assert [a.outcome for a in out.attempts] == ["timeout", "success"]
+    assert backup.calls == []
+
+
+def test_async_router_concurrent_attempts_do_not_clobber_each_other():
+    flaky = AsyncFakeProvider(
+        "primary", name="primary", fail_times=1, fail_kind="rate_limit", delay=0.02
+    )
+    backup = AsyncFakeProvider("backup", name="backup", delay=0.02)
+    router = AsyncRouter(
+        providers={"primary": flaky, "backup": backup},
+        default=Route(provider="primary", model="fake-large"),
+        fallbacks=[Route(provider="backup", model="fake-small")],
+    )
+
+    async def two_calls():
+        return await asyncio.gather(
+            router.complete(MESSAGES),
+            router.complete(MESSAGES),
+        )
+
+    r1, r2 = run(two_calls())
+    # One call failed over (2 attempts), the other succeeded directly (1 attempt).
+    lengths = sorted(len(r.attempts) for r in (r1, r2))
+    assert lengths == [1, 2]

@@ -20,18 +20,31 @@ import os
 import urllib.error
 import urllib.request
 
-from .provider import Completion, Message, ProviderError, Usage
+from .provider import Completion, FailureKind, Message, ProviderError, Usage
 
 ANTHROPIC_VERSION = "2023-06-01"
 """Value sent in the ``anthropic-version`` header."""
 
-USER_AGENT = "budgetrouter/0.1.0"
+USER_AGENT = "budgetrouter/0.2.0"
 """Value sent in the ``User-Agent`` header of every adapter request.
 
 urllib's default ``Python-urllib/x.y`` agent is rejected outright by
 some API gateways (Cloudflare-fronted endpoints answer HTTP 403, error
 1010), so the adapters identify themselves explicitly instead.
 """
+
+
+def _classify_http_status(status_code: int) -> FailureKind:
+    """Map an HTTP status code to a :class:`FailureKind`."""
+    if status_code == 429:
+        return "rate_limit"
+    if status_code in (401, 403):
+        return "auth"
+    if 500 <= status_code <= 599:
+        return "server_error"
+    if 400 <= status_code <= 499:
+        return "invalid_request"
+    return "unknown"
 
 
 def _resolve_api_key(
@@ -43,7 +56,8 @@ def _resolve_api_key(
     if not value:
         raise ProviderError(
             f"{provider_name}: no API key given and environment variable "
-            f"{api_key_env} is not set"
+            f"{api_key_env} is not set",
+            kind="auth",
         )
     return value
 
@@ -58,7 +72,8 @@ def _post_json(
     """POST ``payload`` as JSON and return the decoded response body.
 
     Any transport failure, non-2xx status, or undecodable body becomes a
-    :class:`ProviderError`, so the router's fallback chain can react.
+    classified :class:`ProviderError`, so the router's fallback policy can
+    react appropriately.
     """
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -77,28 +92,44 @@ def _post_json(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:200]
         raise ProviderError(
-            f"{provider_name}: HTTP {exc.code} from {url}: {detail}"
+            f"{provider_name}: HTTP {exc.code} from {url}: {detail}",
+            kind=_classify_http_status(exc.code),
+            status_code=exc.code,
         ) from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise ProviderError(
+                f"{provider_name}: request to {url} timed out",
+                kind="timeout",
+            ) from exc
         raise ProviderError(
-            f"{provider_name}: request to {url} failed: {exc.reason}"
+            f"{provider_name}: request to {url} failed: {exc.reason}",
+            kind="transport",
         ) from exc
     except TimeoutError as exc:
-        raise ProviderError(f"{provider_name}: request to {url} timed out") from exc
+        raise ProviderError(
+            f"{provider_name}: request to {url} timed out",
+            kind="timeout",
+        ) from exc
     try:
         raw = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ProviderError(
-            f"{provider_name}: undecodable response from {url}: {exc}"
+            f"{provider_name}: undecodable response from {url}: {exc}",
+            kind="bad_response",
         ) from exc
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProviderError(
-            f"{provider_name}: undecodable response from {url}: {exc}"
+            f"{provider_name}: undecodable response from {url}: {exc}",
+            kind="bad_response",
         ) from exc
     if not isinstance(decoded, dict):
-        raise ProviderError(f"{provider_name}: unexpected response shape from {url}")
+        raise ProviderError(
+            f"{provider_name}: unexpected response shape from {url}",
+            kind="bad_response",
+        )
     return decoded
 
 
@@ -130,7 +161,8 @@ def _parse_usage(
         return Usage(input_tokens=input_fallback, output_tokens=output_fallback)
     if not isinstance(usage_data, dict):
         raise ProviderError(
-            f"{provider_name}: malformed usage block: {usage_data!r}"
+            f"{provider_name}: malformed usage block: {usage_data!r}",
+            kind="bad_response",
         )
     parsed: dict[str, int] = {}
     for key, fallback in (
@@ -145,11 +177,13 @@ def _parse_usage(
             value = int(raw_value)
         except (TypeError, ValueError) as exc:
             raise ProviderError(
-                f"{provider_name}: malformed usage value {key}={raw_value!r}"
+                f"{provider_name}: malformed usage value {key}={raw_value!r}",
+                kind="bad_response",
             ) from exc
         if value < 0:
             raise ProviderError(
-                f"{provider_name}: negative usage value {key}={value}"
+                f"{provider_name}: negative usage value {key}={value}",
+                kind="bad_response",
             )
         parsed[key] = value
     return Usage(
@@ -195,7 +229,8 @@ class OpenAICompatibleProvider:
             text = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(
-                f"{self.name}: malformed chat-completions response: {exc}"
+                f"{self.name}: malformed chat-completions response: {exc}",
+                kind="bad_response",
             ) from exc
         usage = _parse_usage(
             data.get("usage"),
@@ -279,7 +314,8 @@ class AnthropicProvider:
             )
         except (KeyError, TypeError, AttributeError) as exc:
             raise ProviderError(
-                f"{self.name}: malformed messages response: {exc}"
+                f"{self.name}: malformed messages response: {exc}",
+                kind="bad_response",
             ) from exc
         usage = _parse_usage(
             data.get("usage"),

@@ -8,6 +8,8 @@ API keys.
 
 import json
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -71,6 +73,10 @@ class StubHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/fail"):
             payload = b'{"error": "stub failure"}'
             self.send_response(500)
+        elif self.path.startswith("/status/"):
+            code = int(self.path.split("/")[2])
+            payload = json.dumps({"error": f"status {code}"}).encode()
+            self.send_response(code)
         elif self.path.startswith("/badutf8"):
             payload = b"\xff\xfe\x00 not valid utf-8"
             self.send_response(200)
@@ -298,5 +304,93 @@ def test_negative_usage_raises_provider_error(stub):
     provider = OpenAICompatibleProvider(
         f"{base_url}/negusage", "stub-small", api_key="test-key"
     )
-    with pytest.raises(ProviderError, match="negative"):
+    with pytest.raises(ProviderError, match="negative") as exc_info:
         provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == "bad_response"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_kind"),
+    [
+        (429, "rate_limit"),
+        (401, "auth"),
+        (403, "auth"),
+        (400, "invalid_request"),
+        (500, "server_error"),
+        (503, "server_error"),
+    ],
+)
+def test_http_status_classification(stub, code, expected_kind):
+    base_url, _ = stub
+    provider = OpenAICompatibleProvider(
+        f"{base_url}/status/{code}", "stub-small", api_key="test-key"
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == expected_kind
+    assert exc_info.value.status_code == code
+
+
+def test_urlerror_wrapping_timeout_classified_as_timeout(monkeypatch):
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider("http://example.invalid", "stub-small", api_key="k")
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == "timeout"
+
+
+def test_urlerror_dns_classified_as_transport(monkeypatch):
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.URLError("name resolution failed")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider("http://example.invalid", "stub-small", api_key="k")
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == "transport"
+
+
+def test_direct_timeout_error_classified_as_timeout(monkeypatch):
+    def fake_urlopen(*args, **kwargs):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider("http://example.invalid", "stub-small", api_key="k")
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == "timeout"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_kind"),
+    [
+        (429, "rate_limit"),
+        (401, "auth"),
+        (403, "auth"),
+        (400, "invalid_request"),
+        (404, "invalid_request"),
+        (500, "server_error"),
+        (503, "server_error"),
+    ],
+)
+def test_http_error_classification_unit(monkeypatch, code, expected_kind):
+    import io
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"HTTP {code}",
+            {},
+            io.BytesIO(b'{"error": "simulated"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider("http://example.invalid", "stub-small", api_key="k")
+    with pytest.raises(ProviderError) as exc_info:
+        provider.complete([{"role": "user", "content": "hi"}], "stub-small")
+    assert exc_info.value.kind == expected_kind
+    assert exc_info.value.status_code == code

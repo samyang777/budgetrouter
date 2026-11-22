@@ -10,14 +10,83 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 Message = dict[str, str]
 """A single chat message, e.g. ``{"role": "user", "content": "hi"}``."""
 
+FailureKind = Literal[
+    "timeout",
+    "rate_limit",
+    "server_error",
+    "auth",
+    "invalid_request",
+    "transport",
+    "bad_response",
+    "unknown",
+]
+"""Classification of a :class:`ProviderError`."""
+
+AttemptOutcome = Literal[
+    "success",
+    "timeout",
+    "rate_limit",
+    "server_error",
+    "auth",
+    "invalid_request",
+    "transport",
+    "bad_response",
+    "budget_exceeded",
+    "unknown",
+]
+"""Outcome recorded on an :class:`AttemptRecord`."""
+
+
+@dataclass(frozen=True)
+class AttemptRecord:
+    """Structured record of one routed attempt (success, failure, or budget block)."""
+
+    provider: str
+    model: str
+    outcome: AttemptOutcome
+    latency_ms: float
+    is_primary: bool
+    bucket: str | None = None
+    status_code: int | None = None
+    error_message: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    actual_cost_usd: float | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome == "success"
+
+    @property
+    def downgraded(self) -> bool:
+        return self.succeeded and not self.is_primary
+
+    @property
+    def route_label(self) -> str:
+        return f"{self.provider}/{self.model}"
+
 
 class ProviderError(RuntimeError):
     """Raised when a provider call fails (the router may fall back)."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        kind: FailureKind = "unknown",
+        status_code: int | None = None,
+        attempts: tuple[AttemptRecord, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.kind: FailureKind = kind
+        self.status_code: int | None = status_code
+        self.attempts: tuple[AttemptRecord, ...] = tuple(attempts)
 
 
 @dataclass
@@ -45,6 +114,7 @@ class Completion:
     model: str
     provider: str
     usage: Usage
+    attempts: tuple[AttemptRecord, ...] = ()
 
 
 @runtime_checkable
@@ -91,12 +161,16 @@ class FakeProvider:
         input_tokens: int = 12,
         output_tokens: int = 8,
         fail_times: int = 0,
+        fail_kind: FailureKind = "unknown",
+        fail_status_code: int | None = None,
     ) -> None:
         self.name = name
         self._responses = responses
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
         self._fail_times = fail_times
+        self._fail_kind: FailureKind = fail_kind
+        self._fail_status_code = fail_status_code
         self.calls: list[tuple[str, list[Message]]] = []
 
     def complete(self, messages: list[Message], model: str) -> Completion:
@@ -104,7 +178,9 @@ class FakeProvider:
         if self._fail_times > 0:
             self._fail_times -= 1
             raise ProviderError(
-                f"{self.name}: simulated failure for model {model!r}"
+                f"{self.name}: simulated failure for model {model!r}",
+                kind=self._fail_kind,
+                status_code=self._fail_status_code,
             )
         text = self._pick_response(model, messages)
         return Completion(
@@ -150,6 +226,8 @@ class AsyncFakeProvider(FakeProvider):
         input_tokens: int = 12,
         output_tokens: int = 8,
         fail_times: int = 0,
+        fail_kind: FailureKind = "unknown",
+        fail_status_code: int | None = None,
         delay: float = 0.0,
     ) -> None:
         super().__init__(
@@ -158,6 +236,8 @@ class AsyncFakeProvider(FakeProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             fail_times=fail_times,
+            fail_kind=fail_kind,
+            fail_status_code=fail_status_code,
         )
         self.delay = delay
 
